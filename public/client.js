@@ -267,7 +267,7 @@
         onLeaderboard(msg);
         break;
       case 'profile':
-        onProfile(msg.profile);
+        onProfile(msg);
         break;
     }
   }
@@ -404,6 +404,8 @@
   let rankSort = 'total';   // total | wins | rate
   let rankRows = null;      // null=尚未拉取/加载中；[]=空赛季
   let rankStartedAt = null;
+  let rankSeasonNo = null;  // 当前赛季序号（服务端返回）
+  let rankSeasonCount = 0;  // 含历史赛季在内的赛季总数
   let rankMyPid = null;     // 服务端从本机密钥派生的公开 pid（用于标出"我"）
   let rankQuery = '';       // 昵称搜索词（纯前端过滤）
   let profileData = null;   // null=尚未拉取；false=该玩家暂无已结束对局
@@ -433,12 +435,18 @@
     rankSort = ['total', 'wins', 'rate'].includes(msg.sort) ? msg.sort : 'total';
     rankRows = Array.isArray(msg.rows) ? msg.rows : [];
     rankStartedAt = msg.startedAt || null;
+    rankSeasonNo = Number(msg.season) > 0 ? Number(msg.season) : null;
+    const seasons = Array.isArray(msg.seasons) ? msg.seasons : null;
+    rankSeasonCount = seasons ? seasons.length : (rankSeasonNo ? rankSeasonNo : 0);
     rankMyPid = typeof msg.myPid === 'string' ? msg.myPid : null;
     renderRank();
   }
 
-  function onProfile(profile) {
-    profileData = profile || false;
+  function onProfile(msg) {
+    // 服务端同时回当前赛季序号；旧服务端/测试桩没有该字段时保持 undefined（渲染走降级文案）
+    profileData = msg.profile
+      ? { ...msg.profile, season: Number(msg.season) > 0 ? Number(msg.season) : msg.profile.season }
+      : false;
     renderProfile();
   }
 
@@ -465,7 +473,10 @@
     for (const [key, id] of [['total', 'btn-sort-total'], ['wins', 'btn-sort-wins'], ['rate', 'btn-sort-rate']]) {
       $(id).classList.toggle('primary', key === rankSort);
     }
-    $('rank-season').textContent = rankStartedAt ? `本赛季自 ${fmtDate(rankStartedAt)} 起` : '';
+    const seasonLabel = rankSeasonNo ? `第 ${rankSeasonNo} 赛季` : '本赛季';
+    const archiveHint = rankSeasonCount > 1 ? ` · 共 ${rankSeasonCount} 个赛季` : '';
+    $('rank-season').textContent =
+      rankStartedAt ? `${seasonLabel} 自 ${fmtDate(rankStartedAt)} 起${archiveHint}` : '';
     renderRankMine();
     const list = $('rank-list');
     if (rankRows === null) { list.innerHTML = '<p class="hint">排行榜加载中…</p>'; return; }
@@ -503,7 +514,7 @@
     box.classList.remove('hidden');
     if (!me) {
       box.innerHTML = `<div class="rank-mine-title">我的战绩</div>
-        <div class="rank-mine-stats"><span class="rm-empty">本赛季还没有完成对局，打完一局就会在这里看到你的名次。</span></div>`;
+        <div class="rank-mine-stats"><span class="rm-empty">当前赛季还没有完成对局，打完一局就会在这里看到你的名次。</span></div>`;
       box.onclick = null;
       return;
     }
@@ -559,6 +570,36 @@
       <p class="hint">徽章按本赛季累计数据自动点亮：场次、胜场、最高连锁达到里程碑即可。</p>`;
   }
 
+  // 各赛季名次：当前赛季（进行中，名次实时）在前，其后是冻结归档的历史赛季（名次不再变）。
+  // 数据来自服务端 profile.seasons；旧服务端/测试桩没有该字段时不渲染这一段（降级）。
+  function renderSeasons(p) {
+    const seasons = Array.isArray(p.seasons) ? p.seasons : [];
+    if (seasons.length <= 1 && (!seasons.length || seasons[0].current)) return '';
+    const row = (sn) => {
+      const tag = sn.current
+        ? '<span class="season-tag current">进行中</span>'
+        : '<span class="season-tag">已归档</span>';
+      const span = sn.startedAt ? fmtDate(sn.startedAt) : '—';
+      const ended = sn.endedAt ? ` → ${fmtDate(sn.endedAt)}` : '';
+      const rank = sn.rank ? `第 ${sn.rank} 名` : '未上榜';
+      return `<tr>
+        <td>第 ${sn.season} 赛季 ${tag}</td>
+        <td><b>${rank}</b></td>
+        <td>${sn.totalScore}</td>
+        <td>${sn.wins}</td>
+        <td>${pct(sn.winRate)}</td>
+        <td>${sn.games}</td>
+        <td class="hint">${span}${ended}</td>
+      </tr>`;
+    };
+    return `<h3 class="seasons-title">各赛季名次</h3>
+      <div class="seasons-table"><table>
+        <tr><th>赛季</th><th>总分榜名次</th><th>总分</th><th>胜场</th><th>胜率</th><th>场次</th><th>时间</th></tr>
+        ${seasons.map(row).join('')}
+      </table></div>
+      <p class="hint">历史赛季在赛季结束时冻结归档，名次与战绩不再变化；新赛季从零重新累计。</p>`;
+  }
+
   function renderProfile() {
     if ($('screen-profile').classList.contains('hidden')) return;
     const box = $('profile-body');
@@ -568,9 +609,11 @@
       return;
     }
     const p = profileData;
-    const rankText = p.rank ? `总分榜第 ${p.rank} 名` : '暂无排名';
+    const seasonLabel = p.season ? `第 ${p.season} 赛季` : '当前赛季';
+    const rankText = p.rank ? `总分榜第 ${p.rank} 名` : '当前赛季暂无排名';
     box.innerHTML = `
       <h3>${esc(p.name)} <span class="hint">（${rankText}）</span></h3>
+      <p class="hint">以下为${seasonLabel}汇总；历史赛季名次见下方。</p>
       <div class="stat-grid">
         <div class="stat"><div class="stat-v">${p.games}</div><div class="stat-k">场次</div></div>
         <div class="stat win"><div class="stat-v">${p.wins}</div><div class="stat-k">胜场</div></div>
@@ -581,6 +624,7 @@
         <div class="stat"><div class="stat-v">${p.avgScore}</div><div class="stat-k">平均得分</div></div>
         <div class="stat"><div class="stat-v">${p.bestChain}</div><div class="stat-k">最高连锁</div></div>
       </div>
+      <div class="seasons-box">${renderSeasons(p)}</div>
       <div class="ach-box">${renderBadges(resolveBadges(p))}</div>
       <p class="hint">最近对局：${p.lastAt ? fmtDate(p.lastAt) : '—'}</p>`;
   }

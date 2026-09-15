@@ -233,8 +233,86 @@ test('个人页：我的战绩凭本机密钥查询；无记录玩家显示空�
 
 test('空赛季排行榜显示空态；返回排行榜按钮不重新请求', () => {
   $id('btn-rank-home').onclick();
-  recv({ type: 'leaderboard', sort: 'total', startedAt: 1000, rows: [] });
+  recv({ type: 'leaderboard', sort: 'total', season: 1, startedAt: 1000,
+    seasons: [{ season: 1, current: true, startedAt: 1000, endedAt: null, players: 0 }], rows: [] });
   assert.match($id('rank-list').innerHTML, /还没有人完成对局/);
+});
+
+test('排行榜头部显示当前赛季序号与赛季总数', () => {
+  $id('btn-rank-home').onclick();
+  recv({ type: 'leaderboard', sort: 'total', season: 3, startedAt: 1000,
+    seasons: [
+      { season: 3, current: true, startedAt: 9000, endedAt: null, players: 1 },
+      { season: 2, current: false, startedAt: 5000, endedAt: 9000, players: 2 },
+      { season: 1, current: false, startedAt: 1000, endedAt: 5000, players: 2 },
+    ], rows: [
+      { rank: 1, pid: 'pidA', name: '甲', games: 1, wins: 1, ties: 0, losses: 0,
+        totalScore: 10, avgScore: 10, bestChain: 3, winRate: 1, lastAt: 5 }] });
+  const head = $id('rank-season').textContent;
+  assert.match(head, /第 3 赛季/);
+  assert.match(head, /共 3 个赛季/);
+
+  // 只有一个赛季时不显示"共 N 个赛季"
+  recv({ type: 'leaderboard', sort: 'total', season: 1, startedAt: 1000,
+    seasons: [{ season: 1, current: true, startedAt: 1000, endedAt: null, players: 1 }], rows: [
+      { rank: 1, pid: 'pidA', name: '甲', games: 1, wins: 1, ties: 0, losses: 0,
+        totalScore: 10, avgScore: 10, bestChain: 3, winRate: 1, lastAt: 5 }] });
+  assert.match($id('rank-season').textContent, /第 1 赛季/);
+  assert.doesNotMatch($id('rank-season').textContent, /共/);
+});
+
+test('个人页：当前赛季汇总带赛季说明，并渲染各赛季名次（进行中 + 已归档）', () => {
+  const profile = {
+    pid: 'pidA', name: '甲', season: 2, rank: 1,
+    games: 1, wins: 1, ties: 0, losses: 0, totalScore: 10, avgScore: 10,
+    bestChain: 3, winRate: 1, lastAt: 9,
+    seasons: [
+      { season: 2, current: true, name: '甲', startedAt: 5000, endedAt: null,
+        rank: 1, games: 1, wins: 1, ties: 0, losses: 0, totalScore: 10, avgScore: 10,
+        bestChain: 3, winRate: 1, lastAt: 9 },
+      { season: 1, current: false, name: '甲', startedAt: 1000, endedAt: 5000,
+        rank: 2, games: 4, wins: 3, ties: 1, losses: 0, totalScore: 80, avgScore: 20,
+        bestChain: 4, winRate: 0.75, lastAt: 4 },
+    ],
+  };
+  askProfileByName(profile);
+  const html = $id('profile-body').innerHTML;
+  assert.match(html, /各赛季名次/);
+  assert.match(html, /第 2 赛季/);
+  assert.match(html, /第 1 赛季/);
+  assert.match(html, /进行中/);
+  assert.match(html, /已归档/);
+  assert.match(html, /第 2 名/, '历史赛季冻结名次展示');
+  assert.match(html, /第 2 赛季汇总|第 2 赛季/);
+});
+
+test('个人页：只在历史赛季有记录的玩家（新赛季未打）仍正常渲染历史名次', () => {
+  const profile = {
+    pid: 'pidOld', name: '老玩家', season: 2, rank: null,
+    games: 0, wins: 0, ties: 0, losses: 0, totalScore: 0, avgScore: 0,
+    bestChain: 0, winRate: 0, lastAt: 0,
+    seasons: [
+      { season: 1, current: false, name: '老玩家', startedAt: 1000, endedAt: 5000,
+        rank: 3, games: 9, wins: 2, ties: 1, losses: 6, totalScore: 60, avgScore: 6.7,
+        bestChain: 3, winRate: 0.22, lastAt: 4 },
+    ],
+  };
+  askProfileByName(profile);
+  const html = $id('profile-body').innerHTML;
+  assert.match(html, /老玩家/);
+  assert.match(html, /当前赛季暂无排名/);
+  assert.match(html, /各赛季名次/);
+  assert.match(html, /第 1 赛季/);
+  assert.match(html, /第 3 名/);
+});
+
+test('个人页：旧服务端响应不带 seasons/season 字段时降级（不渲染赛季段、不报错）', () => {
+  askProfileByName({ pid: 'pidZ', name: '旧', rank: 1, games: 1, wins: 1, ties: 0, losses: 0,
+    totalScore: 5, avgScore: 5, bestChain: 1, winRate: 1, lastAt: 9 });
+  const html = $id('profile-body').innerHTML;
+  assert.match(html, /旧/);
+  assert.doesNotMatch(html, /各赛季名次/);
+  assert.match(html, /当前赛季/);
 });
 
 test('排行榜请求随带本机密钥，服务端回 myPid 后高亮我的行并置顶显示汇总', () => {

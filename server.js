@@ -43,18 +43,52 @@ let seasonLegacy = true;
 
 function loadSeason() {
   try {
-    const { season: loaded, legacy } = seasonLib.normalizeSeason(
-      JSON.parse(fs.readFileSync(SEASON_FILE, 'utf8')));
+    const raw = JSON.parse(fs.readFileSync(SEASON_FILE, 'utf8'));
+    const prevVersion = Math.trunc(Number(raw && raw.version)) || 1;
+    const { season: loaded, legacy } = seasonLib.normalizeSeason(raw);
     season = loaded;
     seasonLegacy = legacy;
-    console.log(`已恢复赛季战绩：${Object.keys(season.players).length} 名玩家`);
+    console.log(`已恢复赛季战绩：第 ${season.season} 赛季、` +
+      `${Object.keys(season.players).length} 名玩家、${season.history.length} 个历史赛季`);
+    // 旧档（v1/v2）在内存里完成了结构迁移（v3：赛季号/history），立即落盘固化：
+    // 否则要等下一次战绩变化才写盘，期间若触发赛季切换，磁盘会从旧结构直接跳到
+    // "已归档"状态，迁移态（老档案整体作为第 1 赛季）从未被持久化。
+    if (prevVersion < seasonLib.ARCHIVE_VERSION) flushSeason();
   } catch { /* 首次启动或数据损坏，从空赛季开始（此时没有任何"已计入"的旧局） */
     seasonLegacy = false;
   }
 }
 
+// 赛季到期切换：先把【已结束但还没补记】的房间补进即将冻结的老赛季（例如跨赛季边界
+// 仍在保留期内、却一直没人重连看结算的局——不能让它被算到新赛季），再冻结归档、开新赛季。
+// 全局逐局索引（recordedRooms）原样保留，任何一局都不可能在两个赛季各算一遍。
+// 冻结与开新赛季在同一档案里原子完成，立即同步落盘，避免"已冻结但没落盘"时进程退出。
+function rolloverIfDue(now = Date.now()) {
+  if (!seasonLib.seasonDue(season, SEASON_MS, now)) return false;
+  let dirty = false;
+  for (const room of rooms.values()) {
+    if (room.phase === 'ended' && !seasonLib.isRoomRecorded(season, room)) {
+      const { changed } = seasonLib.recordRoom(season, room, now);
+      if (changed) dirty = true;
+    }
+  }
+  if (dirty) flushSeason(); // 补记的局先进老赛季文件，再做冻结
+  const { rolledOver, frozen } = seasonLib.rolloverSeason(season, SEASON_MS, now);
+  if (rolledOver) {
+    flushSeason();
+    if (frozen) {
+      console.log(`第 ${frozen.season} 赛季已冻结归档（${Object.keys(frozen.players).length} 名玩家），` +
+        `第 ${season.season} 赛季开始重新累计`);
+    } else {
+      console.log(`空赛季跳过归档，第 ${season.season} 赛季开始`);
+    }
+  }
+  return rolledOver;
+}
+
 let seasonSaveTimer = null;
 function saveSeason() {
+  if (shuttingDown) return;
   clearTimeout(seasonSaveTimer);
   seasonSaveTimer = setTimeout(() => {
     try {
@@ -88,6 +122,7 @@ function loadShares() {
 
 let sharesSaveTimer = null;
 function saveShares() {
+  if (shuttingDown) return;
   clearTimeout(sharesSaveTimer);
   sharesSaveTimer = setTimeout(() => {
     try {
@@ -121,6 +156,7 @@ function loadPlaza() {
 
 let plazaSaveTimer = null;
 function savePlaza() {
+  if (shuttingDown) return;
   clearTimeout(plazaSaveTimer);
   plazaSaveTimer = setTimeout(() => {
     try {
@@ -154,9 +190,27 @@ const SPECTATOR_TTL_MS = Number(process.env.SPECTATOR_TTL_MS) || 60 * 1000;
 const ROOM_RETENTION_MS = Number(process.env.WT_ROOM_TTL_MS) || 7 * 24 * 60 * 60 * 1000;
 // 保留期清理的周期检查间隔（长期不重启也能自动收敛存档）
 const ROOM_PRUNE_INTERVAL_MS = Number(process.env.WT_ROOM_PRUNE_INTERVAL_MS) || 60 * 60 * 1000;
+// 单个赛季时长（毫秒）：到期把当前榜单冻结进赛季历史、开新赛季重新累计。
+// 默认 30 天；显式设为 0/负数表示永不自动切换（仅保留单赛季）。
+// 不能用 `Number(...) || 默认值`：0 是合法值（禁用切换），会被 || 误当假值回退。
+const SEASON_MS = (() => {
+  const v = process.env.WT_SEASON_MS;
+  if (v == null || v === '') return 30 * 24 * 60 * 60 * 1000; // 未配置：默认 30 天
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0; // 0/负数/非数均视为禁用自动切换
+})();
 
 function loadRooms() {
   try {
+    // 同一进程内 stop→start（测试场景）时内存状态必须以磁盘为准：先清空上一轮残留的
+    // 房间/token/计时句柄，否则旧房间会与磁盘读出的房间并存（日志会出现"磁盘 1 间、
+    // 恢复 3 间"），还可能让早已停服的对局参与赛季对账。
+    rooms.clear();
+    tokens.clear();
+    for (const t of turnTimers.values()) clearTimeout(t);
+    turnTimers.clear();
+    for (const t of spectatorPruneTimers.values()) clearTimeout(t);
+    spectatorPruneTimers.clear();
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     const loadedRoomCodes = new Set();
     for (const room of raw.rooms) {
@@ -213,7 +267,12 @@ function loadRooms() {
 }
 
 let saveTimer = null;
+// 停机守卫：stopServer 清掉防抖定时器后，仍在途中的广播/回调若再触发 saveRooms，
+// 会重新挂一个定时器并在进程退出后把内存房间写回磁盘——测试里这会覆盖停服后手工
+// 准备的存档。停机后一律不再重新挂防抖（最终状态已由 flush 同步落盘）。
+let shuttingDown = false;
 function saveRooms() {
+  if (shuttingDown) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     try {
@@ -295,16 +354,37 @@ function pruneExpiredRooms(now = Date.now()) {
 let roomPruneTimer = null;
 function scheduleRoomPruning() {
   if (!(ROOM_PRUNE_INTERVAL_MS > 0)) return;
-  roomPruneTimer = setInterval(() => pruneExpiredRooms(), ROOM_PRUNE_INTERVAL_MS);
+  // 同一周期任务先做赛季切换（先于清理：漏记的结束房在冻结前补进老赛季），再清超期房间
+  roomPruneTimer = setInterval(() => {
+    rolloverIfDue();
+    pruneExpiredRooms();
+  }, ROOM_PRUNE_INTERVAL_MS);
   roomPruneTimer.unref?.(); // 测试/短进程中定时器不挂住退出
 }
 
 // ---------- 广播 ----------
 
+// 全部赛季的轻量元信息（当前赛季 + 已冻结赛季，最新在前）：客户端排行榜头部展示
+// "第 N 赛季/共 N 个赛季"用。玩家级数据不在这里，逐赛季名次走个人页 profile.seasons。
+function seasonMeta(s) {
+  const list = (s.history || []).map(h => ({
+    season: h.season, startedAt: h.startedAt, endedAt: h.endedAt,
+    players: Object.keys(h.players || {}).length, current: false,
+  }));
+  list.unshift({
+    season: s.season, startedAt: s.startedAt, endedAt: null,
+    players: Object.keys(s.players || {}).length, current: true,
+  });
+  return list;
+}
+
 function broadcast(room) {
+  // 有对局活动时惰性检查赛季切换：哪怕周期任务间隔很长，赛季一到期产生的新结算
+  // 也一定计入新赛季（切换前会先把所有漏记的结束房补进老赛季，见 rolloverIfDue）。
+  rolloverIfDue();
   // 对局首次结束：为每名可识别玩家（带跨对局稳定 pid）累计一条公开赛季战绩。
-  // 进程内用 seasonRecorded 做快速短路；真正的幂等凭据是赛季档案的逐局索引——
-  // 重连/重启后房间标记可能残留，但 recordRoom 内部只认索引，重复广播不会重复累计。
+  // 进程内用 seasonRecorded 做快速短路；真正的幂等凭据是跨赛季全局逐局索引——
+  // 重连/重启后房间标记可能残留，但 recordRoom 内部只认索引，重复广播/跨赛季都不会重复累计。
   if (room.phase === 'ended' && !room.seasonRecorded) {
     const { changed } = seasonLib.recordRoom(season, room);
     if (changed) saveSeason();
@@ -755,17 +835,22 @@ const handlers = {
   // 服务端在响应里回 myPid，用于客户端高亮"我"那一行、置顶显示我的汇总。
   leaderboard(ws, ctx, msg) {
     const sort = ['total', 'wins', 'rate'].includes(msg.sort) ? msg.sort : 'total';
+    rolloverIfDue(); // 打开排行榜即感知新赛季（即便新赛季一局都还没打，空榜也属于新赛季）
     const rows = seasonLib.leaderboard(season, { sort });
     const { pid: myPid } = seasonLib.resolvePid(msg);
     if (ws.readyState === 1) {
       ws.send(JSON.stringify({ type: 'leaderboard', sort,
-        startedAt: season.startedAt, rows, myPid: myPid || null }));
+        season: season.season, startedAt: season.startedAt,
+        seasons: seasonMeta(season),
+        rows, myPid: myPid || null }));
     }
   },
 
   // 个人页（公开，只读）：可凭公开 pid（点排行榜某行）或本人密钥（"我的战绩"）查看
-  // 场次/胜场/平局/平均得分/最高连锁等汇总。密钥经单向哈希换成 pid 后再查，密钥本身不落库。
+  // 当前赛季的场次/胜场/平局/平均得分/最高连锁，以及各历史赛季的冻结名次（seasons）。
+  // 密钥经单向哈希换成 pid 后再查，密钥本身不落库。
   profile(ws, ctx, msg) {
+    rolloverIfDue();
     const { pid } = seasonLib.resolvePid(msg);
     const target = pid || (seasonLib.isValidPid(msg.pid) ? msg.pid : null);
     if (!target) {
@@ -773,7 +858,7 @@ const handlers = {
       return;
     }
     if (ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'profile',
+      ws.send(JSON.stringify({ type: 'profile', season: season.season,
         profile: seasonLib.getProfile(season, target) }));
     }
   },
@@ -845,9 +930,13 @@ function attachWebSocketServer() {
 
 function startServer(port = PORT) {
   return new Promise((resolve) => {
+    shuttingDown = false; // 同一进程内 stop→start（测试场景）：恢复防抖写盘
     // 先恢复赛季战绩：恢复房间时若发现结束房漏记，清理前可兜底补记进赛季
     loadSeason();
     loadRooms();
+    // 启动时若当前赛季窗口早已结束：漏记的结束房已随 loadRooms 对账/清理补进老赛季，
+    // 此刻冻结归档、开新赛季（随后周期任务与各类请求还会惰性复查）。
+    rolloverIfDue();
     loadShares();
     loadPlaza();
     scheduleRoomPruning();
@@ -860,6 +949,7 @@ function startServer(port = PORT) {
 }
 
 function stopServer() {
+  shuttingDown = true; // 此后在途广播/回调不再重新挂防抖写盘（最终状态下面立即 flush）
   // 停掉所有定时器，避免保存防抖/回合/观战清理等句柄让进程挂住
   clearTimeout(saveTimer);
   clearTimeout(seasonSaveTimer);

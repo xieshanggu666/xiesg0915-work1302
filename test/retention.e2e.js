@@ -17,6 +17,7 @@ process.env.WT_DATA_FILE = DATA_FILE;
 process.env.WT_SEASON_FILE = SEASON_FILE;
 process.env.WT_ROOM_TTL_MS = String(5000);        // 保留期 5 秒
 process.env.WT_ROOM_PRUNE_INTERVAL_MS = String(100); // 运行期快速周期清理
+process.env.WT_SEASON_MS = '0';                    // 关闭赛季自动切换：本文件只验证保留期语义
 
 const game = require('../game');
 const seasonLib = require('../season');

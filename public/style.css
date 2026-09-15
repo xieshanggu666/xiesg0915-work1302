@@ -319,6 +319,21 @@ button.danger-link { border: none; background: none; color: var(--danger); paddi
 .ach-bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
 @media (max-width: 480px) { .ach-grid { grid-template-columns: repeat(2, 1fr); } }
 
+/* 各赛季名次（个人页） */
+.seasons-box { margin: 4px 0 10px; }
+.seasons-title { margin-bottom: 8px; }
+.seasons-table { overflow-x: auto; }
+.seasons-table table { width: 100%; border-collapse: collapse; }
+.seasons-table td, .seasons-table th {
+  padding: 8px 6px; text-align: left; border-bottom: 1px solid var(--line); font-size: 14px;
+  white-space: nowrap;
+}
+.season-tag {
+  font-size: 11px; color: var(--muted); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 1px 7px; margin-left: 4px;
+}
+.season-tag.current { color: #fff; background: var(--accent); border-color: var(--accent); }
+
 /* 主题词包 */
 #pack-card .pack-theme-line { font-size: 14px; margin: 4px 0 8px; }
 .pack-words { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }

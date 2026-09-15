@@ -14,6 +14,7 @@ process.env.WT_DATA_FILE = DATA_FILE;
 process.env.WT_SEASON_FILE = SEASON_FILE;
 process.env.WT_ROOM_TTL_MS = String(60 * 60 * 1000); // 保留期 1 小时
 process.env.WT_ROOM_PRUNE_INTERVAL_MS = String(3600 * 1000);
+process.env.WT_SEASON_MS = '0'; // 关闭赛季自动切换：本文件只验证 v1→新版的索引对账
 
 const game = require('../game');
 const seasonLib = require('../season');
@@ -99,9 +100,10 @@ async function main() {
   BASE_URL = `ws://localhost:${srv.port}`;
   await sleep(500); // 等对账落盘（flushSeason 同步，多等一轮房间防抖）
 
-  // 赛季文件已升级到 v2：三间现存结束房都在索引里，但玩家汇总保持 3 场不重算
+  // 赛季文件已升级到 v3：仍是第 1 赛季，三间现存结束房都在索引里，玩家汇总保持 3 场不重算
   const upgraded = JSON.parse(fs.readFileSync(SEASON_FILE, 'utf8'));
-  check('赛季档升级为 v2 且建立逐局索引', upgraded.version === 2 &&
+  check('赛季档升级为 v3（第 1 赛季）且建立逐局索引', upgraded.version === 3 &&
+    upgraded.season === 1 &&
     Object.keys(upgraded.recordedRooms).length === 3);
   check('历史对局只登记索引、不重复累计战绩',
     upgraded.players[PID_A].games === 3 && upgraded.players[PID_A].totalScore === 999 &&
